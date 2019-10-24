@@ -62,55 +62,41 @@ fn send_message(
     Ok(())
 }
 
-fn joined_rooms(login_response: &LoginResponse) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let url = format!(
-        "https://{}/_matrix/client/r0/joined_rooms?access_token={}",
-        login_response.home_server, login_response.access_token
-    );
-    let res = reqwest::Client::new().get(&url).send()?.text()?;
-    println!("joined_rooms response was {}", res);
-    #[derive(Debug, Serialize, Deserialize)]
-    struct JoinedRoomsResponse {
-        joined_rooms: Vec<String>,
-    }
-    let joined_rooms: JoinedRoomsResponse = serde_json::from_str(&res)?;
-    joined_rooms
-        .joined_rooms
-        .into_iter()
-        .map(|room_id| {
-            let url = format!(
-                "https://{}/_matrix/client/r0/rooms/{}/state/m.room.name?access_token={}",
-                login_response.home_server, room_id, login_response.access_token
-            );
-            let res = reqwest::Client::new().get(&url).send()?.text()?;
-            println!("{}: {}", res, room_id);
-            #[derive(Debug, Serialize, Deserialize)]
-            struct RoomNameResponse {
-                name: String,
-            }
-            if let Ok(name) = serde_json::from_str::<RoomNameResponse>(&res) {
-                Ok((name.name, room_id))
-            } else {
-                Ok(("unnamed".to_owned(), room_id))
-            }
-        })
-        .collect()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageContent {
     body: String,
     msgtype: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoomName {
     name: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RoomMembership {
+    displayname: Option<String>,
+    membership: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RoomCreate {
+    creator: String,
+    room_version: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReactionContent {
+    #[serde(rename = "m.relates_to")]
+    relates_to: ReactionRelates,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReactionRelates {
+    event_id: String,
+    key: String,
+    rel_type: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum Event {
     #[serde(rename = "m.room.message")]
-    Message {
+    RoomMessage {
         content: MessageContent,
         #[serde(flatten)]
         meta: EventMeta,
@@ -121,25 +107,59 @@ enum Event {
         #[serde(flatten)]
         meta: EventMeta,
     },
+    #[serde(rename = "m.room.member")]
+    RoomMember {
+        content: RoomMembership,
+        #[serde(flatten)]
+        meta: EventMeta,
+    },
+    #[serde(rename = "m.room.create")]
+    RoomCreate {
+        content: RoomCreate,
+        #[serde(flatten)]
+        meta: EventMeta,
+    },
+    #[serde(rename = "m.reaction")]
+    RoomReaction {
+        content: ReactionContent,
+        #[serde(flatten)]
+        meta: EventMeta,
+    },
+    #[serde(rename = "m.room.encryption")]
+    RoomEncryption {
+        #[serde(flatten)]
+        meta: EventMeta,
+    },
+    #[serde(rename = "m.room.encrypted")]
+    RoomEncrypted {
+        #[serde(flatten)]
+        meta: EventMeta,
+    },
+    #[serde(other)]
+    Other,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventMeta {
     event_id: String,
     origin_server_ts: usize,
     sender: String,
     // unsigned: { "age": usize }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Timeline {
     events: Vec<Event>,
     limited: bool,
     prev_batch: String,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State {
+    events: Vec<Event>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoomData {
     //account_data: Vec<Event>,
     //ephemeral: Vec<Event>,
-    //state: Vec<Event>,
+    state: State,
     //summary: {}
     timeline: Timeline,
     //unread_notifications: {
@@ -147,13 +167,13 @@ struct RoomData {
         //notification_count  2,
     //}
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InviteJoinLeave {
     invite: HashMap<String, RoomData>,
     join: HashMap<String, RoomData>,
     leave: HashMap<String, RoomData>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncResponse {
     //account_data: {
         //events: [
@@ -212,7 +232,7 @@ fn sync(login_response: &LoginResponse) -> Result<SyncResponse, Box<dyn Error>> 
         login_response.home_server, login_response.access_token
     );
     let res = reqwest::Client::new().get(&url).send()?.text()?;
-    println!("sync response was {}", res);
+    //println!("sync response was {}", res);
     Ok(serde_json::from_str(&res)?)
 }
 
@@ -228,7 +248,7 @@ fn room_messages(login_response: &LoginResponse, room: &str, from: &str) -> Resu
         login_response.home_server, room, login_response.access_token, from
     );
     let res = reqwest::Client::new().get(&url).send()?.text()?;
-    println!("room_messages response was {}", res);
+    //println!("room_messages response was {}", res);
     Ok(serde_json::from_str(&res)?)
 }
 
@@ -246,36 +266,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_writer(File::create(filename)?, &login_response)?;
         login_response
     };
-    let rooms = joined_rooms(&login_response)?;
-    println!("Currently joined_rooms:");
-    for (i, (room_name, room_id)) in rooms.iter().enumerate() {
+    let synced = sync(&login_response)?;
+    //println!("synced {:?}", synced);
+    let room_keys = synced.rooms.join.iter().map(|(k,v)| k.clone()).collect::<Vec<String>>();
+    for (i, room_id) in room_keys.iter().enumerate() {
+        let room_name = synced.rooms.join.get(room_id).unwrap().state.events.iter().find_map(|e| match e { Event::RoomName { content, meta } => Some(content.name.clone()), _ => None}).unwrap_or("NONE".to_owned());
         println!("{}: {}/{}", i+1, room_name, room_id);
     }
-    let synced = sync(&login_response)?;
-    println!("synced {:?}", synced);
     loop {
         let room = input("What room to send to? (enter number, 0 to sync, -room for room events): ")?
             .trim()
             .parse::<i64>()?;
         if room > 0 {
             let message = input("What is your message?: ")?.trim().to_owned();
-            send_message(&login_response, &rooms[(room-1) as usize].1, &message)?;
+            send_message(&login_response, &room_keys[(room-1) as usize], &message)?;
         } else if room == 0 {
         } else {
             println!("room events from sync:");
-            let room_id = &rooms[((-room)-1) as usize].1;
-            for event in &synced.rooms.join.get(room_id).unwrap().timeline.events {
-                match event {
-                    Event::Message { content, meta } => println!("\t{}: {}", meta.sender, content.body),
-                    Event::RoomName { content, meta } => println!("\t{} set room name to \"{}\"", meta.sender, content.name),
-                }
-            }
+            let room_id = &room_keys[((-room)-1) as usize];
+            let mut events = synced.rooms.join.get(room_id).unwrap().timeline.events.clone();
             let room_message_updates = room_messages(&login_response, room_id, &synced.next_batch)?;
-            println!("room events from room messages updates:");
-            for event in &room_message_updates.chunk {
+            let mut next_batch = synced.next_batch.clone();
+            while let Ok(mut room_message_updates) = room_messages(&login_response, room_id, &next_batch) {
+                if room_message_updates.chunk.len() == 0 {
+                    break;
+                }
+                next_batch = room_message_updates.end;
+                events.append(&mut room_message_updates.chunk);
+            }
+            for event in &events {
                 match event {
-                    Event::Message { content, meta } => println!("\t{}: {}", meta.sender, content.body),
+                    Event::RoomMessage { content, meta } => println!("\t{}: {}", meta.sender, content.body),
                     Event::RoomName { content, meta } => println!("\t{} set room name to \"{}\"", meta.sender, content.name),
+                    _ => println!("\tUnknown event {:?}", event),
                 }
             }
         }
